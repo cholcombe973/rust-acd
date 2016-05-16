@@ -7,27 +7,30 @@ extern crate rustc_serialize;
 extern crate time;
 extern crate crypto;
 extern crate rusqlite;
+extern crate tempdir;
+extern crate rand;
 
-pub mod rest;
-pub mod error;
+mod rest;
+mod error;
+
+pub use error::{Result, Error};
 
 use url::{Url, form_urlencoded};
 use std::process::Command;
 use std::io::{self, Read, Write};
 use rustc_serialize::{json, Decodable, Encodable};
-use rustc_serialize::hex::ToHex;
-use std::fs::File;
+use std::fs::{self, File};
 use time::Timespec;
 use std::path::{Path, Component};
 use rest::RestBuilder;
-use error::{Result, Error};
 use std::time::Duration;
 use hyper::status::StatusCode;
+use crypto::sha2::Sha256;
 use crypto::md5::Md5;
 use crypto::digest::Digest;
-use rusqlite::Connection;
 use hyper::http;
 use hyper::client::pool::Pool;
+use std::path::PathBuf;
 
 
 /// How many times we retry contacting Amazon after a server error
@@ -36,14 +39,27 @@ const DEFAULT_RETRY: u8 = 5;
 const REFRESH_ENDPOINT_TIME: i64 = 3*24;
 
 
+pub struct Client {
+	config_dir: PathBuf,
+	security_profile: SecurityProfile,
+	authorization: Authorization,
+	endpoint: Endpoint,
+	root_id: NodeId,
+	cache_connection: rusqlite::Connection,
+	protocol: Box<http::Protocol>,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct NodeId(String);
+
 #[derive(RustcEncodable, RustcDecodable)]
-pub struct SecurityProfile {
+struct SecurityProfile {
 	pub client_id: String,
 	pub client_secret: String,
 }
 
 #[derive(RustcEncodable, RustcDecodable)]
-pub struct Authorization {
+struct Authorization {
 	pub access_token: Option<String>,
 	pub refresh_token: String,
 	pub token_type: String,
@@ -51,14 +67,11 @@ pub struct Authorization {
 }
 
 #[derive(RustcEncodable, RustcDecodable)]
-pub struct Endpoint {
+struct Endpoint {
 	pub content_url: String,
 	pub metadata_url: String,
 	pub date_last_updated: i64,
 }
-
-
-
 
 #[derive(RustcDecodable, Debug)]
 struct O2TokenResponse {
@@ -101,79 +114,106 @@ struct NodeUploadResponse {
 }
 
 
-pub struct AmazonCloudDrive {
-	security_profile: SecurityProfile,
-	authorization: Authorization,
-	endpoint: Endpoint,
-	root_id: String,
-	cache_conn: Connection,
-	protocol: Box<http::Protocol>,
-}
+impl Client {
+	/// Create a new instances of AmazonCloudDrive.
+	/// client_id and client_secret come from an Amazon security profile.  They do not represent
+	/// a specific cloud drive account.  Rather, the security profile comes from an Amazon
+	/// developer account and basically represent an "App".
+	/// When creating a new instance without any pre-existing configuration, the user will be
+	/// prompted to give access to their Amazon Cloud Drive account.  That's how we tie into
+	/// a specific ACD account.  The authorization will be stored in the config_dir so it can
+	/// be re-used in the future and not prompt the user again.
+	pub fn new<P: AsRef<Path>>(client_id: &str, client_secret: &str, config_dir: P) -> Result<Client> {
+		// Hash the client_id, and then we'll used it to create a unique directory
+		// inside the config_dir to store all of our configuration.
+		// This prevents any conflict if using the same config_dir for different security profile.
+		let client_hash = {
+			let mut sha256 = Sha256::new();
+			sha256.input_str(client_id);
+			sha256.result_str().to_lowercase()
+		};
+		let config_dir = config_dir.as_ref().join(String::from("acd.") + &client_hash);
 
+		// Create configuration directory
+		try!(fs::create_dir_all(&config_dir));
 
-impl AmazonCloudDrive {
-	pub fn new() -> Result<AmazonCloudDrive> {
-		let cache_conn = Connection::open("acd.cache.sqlite").unwrap();
+		let cache_conn = try!(Client::init_cache(&config_dir));
 
-		cache_conn.execute("CREATE TABLE IF NOT EXISTS path_cache (
-			parent TEXT NOT NULL,
-			name TEXT NOT NULL,
-			id TEXT NOT NULL
-		)", &[]).unwrap();
+		let security_profile = SecurityProfile {
+			client_id: client_id.to_owned(),
+			client_secret: client_secret.to_owned(),
+		};
 
-		cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_path_cache_parent_name ON path_cache (parent, name);", &[]).unwrap();
-		cache_conn.execute("CREATE INDEX IF NOT EXISTS idx_path_cache_parent ON path_cache (parent);", &[]).unwrap();
-
-		let security_profile = read_json_file("acd.security_profile.json").unwrap();
-		let endpoint = read_json_file("acd.endpoint.json").unwrap_or(Endpoint {
-			content_url: "".to_owned(),
-			metadata_url: "".to_owned(),
+		// Read existing endpoint or start from scratch.
+		let endpoint = read_json_file(config_dir.join("endpoint.json")).unwrap_or(Endpoint {
+			content_url: String::new(),
+			metadata_url: String::new(),
 			date_last_updated: 0,
 		});
-		let authorization = read_json_file("acd.authorization.json").unwrap_or(Authorization {
+
+		// Read existing authorization or start from scratch.
+		let authorization = read_json_file(config_dir.join("authorization.json")).unwrap_or(Authorization {
 			access_token: None,
-			refresh_token: "".to_owned(),
-			token_type: "".to_owned(),
+			refresh_token: String::new(),
+			token_type: String::new(),
 			date_last_updated: 0,
 		});
 
-		let mut acd = AmazonCloudDrive {
+		let mut acd = Client {
+			config_dir: config_dir,
 			security_profile: security_profile,
 			authorization: authorization,
 			endpoint: endpoint,
-			root_id: String::new(),
-			cache_conn: cache_conn,
+			root_id: NodeId(String::new()),
+			cache_connection: cache_conn,
 			protocol: Box::new(http::h1::Http11Protocol::with_connector(Pool::new(Default::default()))),
 		};
 
-		if let None = acd.authorization.access_token {
+		// If we aren't authorized yet, authorize.
+		if acd.authorization.access_token.is_none() {
 			try!(acd.authorize());
-			write_json_file("acd.authorization.json", &acd.authorization);
+			try!(write_json_file(acd.config_dir.join("authorization.json"), &acd.authorization));
 		}
 
 		try!(acd.refresh_endpoint());
-		write_json_file("acd.endpoint.json", &acd.endpoint);
+		try!(write_json_file(acd.config_dir.join("endpoint.json"), &acd.endpoint));
 		acd.root_id = try!(acd.find_root());
 		Ok(acd)
 	}
 
-	fn insert_into_node_cache(&mut self, parent: &str, name: &str, id: &str) {
-		self.cache_conn.execute("INSERT INTO path_cache (parent, name, id) VALUES (?,?,?)", &[&parent.to_owned(), &name.to_owned(), &id.to_owned()]).unwrap();
+	fn init_cache<P: AsRef<Path>>(config_dir: P) -> Result<rusqlite::Connection> {
+		let conn = try!(rusqlite::Connection::open(config_dir.as_ref().join("cache.sqlite")));
+
+		// Set up tables if they don't exist
+		try!(conn.execute("CREATE TABLE IF NOT EXISTS path_cache (
+			parent TEXT NOT NULL,
+			name TEXT NOT NULL,
+			id TEXT NOT NULL
+		)", &[]));
+		try!(conn.execute("CREATE INDEX IF NOT EXISTS idx_path_cache_parent_name ON path_cache (parent, name);", &[]));
+		try!(conn.execute("CREATE INDEX IF NOT EXISTS idx_path_cache_parent ON path_cache (parent);", &[]));
+
+		Ok(conn)
 	}
 
-	fn fetch_from_node_cache(&self, parent: &str, name: &str) -> Option<String> {
-		let result = self.cache_conn.query_row("SELECT id FROM path_cache WHERE parent=? AND name=?", &[&parent.to_owned(), &name.to_owned()], |row| {
-        	row.get(0)
+	fn insert_into_node_cache(&mut self, &NodeId(ref parent): &NodeId, name: &str, id: &str) -> Result<()> {
+		try!(self.cache_connection.execute("INSERT INTO path_cache (parent, name, id) VALUES (?,?,?)", &[&parent.to_owned(), &name.to_owned(), &id.to_owned()]));
+		Ok(())
+	}
+
+	fn fetch_from_node_cache(&self, &NodeId(ref parent): &NodeId, name: &str) -> Result<Option<NodeId>> {
+		let result = self.cache_connection.query_row("SELECT id FROM path_cache WHERE parent=? AND name=?", &[&parent.to_owned(), &name.to_owned()], |row| {
+        	NodeId(row.get(0))
     	});
 
 		match result {
-			Ok(id) => Some(id),
-			Err(rusqlite::Error::QueryReturnedNoRows) => None,
-			Err(err) => panic!("Sqlite error: {}", err),
+			Ok(id) => Ok(Some(id)),
+			Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+			Err(err) => Err(Error::from(err)),
 		}
 	}
 
-	pub fn get_server_response(&mut self, rest: RestBuilder, repeat: bool, retry: u8) -> Result<(hyper::status::StatusCode, Vec<u8>)> {
+	fn get_server_response(&mut self, rest: RestBuilder, repeat: bool, retry: u8) -> Result<(hyper::status::StatusCode, Vec<u8>)> {
 		#[derive(RustcDecodable, Debug)]
 		struct MessageResponse {
 			message: String,
@@ -355,12 +395,12 @@ impl AmazonCloudDrive {
 			date_last_updated: time::get_time().sec,
 		};
 
-		write_json_file("acd.authorization.json", &self.authorization);
+		try!(write_json_file(self.config_dir.join("authorization.json"), &self.authorization));
 
 		Ok(())
 	}
 
-	fn find_root(&mut self) -> Result<String> {
+	fn find_root(&mut self) -> Result<NodeId> {
 		let request = RestBuilder::get(&self.endpoint.metadata_url.clone())
 			.url_push("nodes")
 			.url_query(&[("filters", "kind:FOLDER AND isRoot:true")])
@@ -371,20 +411,20 @@ impl AmazonCloudDrive {
 		match status_code {
 			StatusCode::Ok => {
 				let response: NodesResponse = try!(decode_server_json(&body));
-				Ok(response.data[0].id.clone())
+				Ok(NodeId(response.data[0].id.clone()))
 			},
 			_ => Err(Error::UnknownServerError(format!("Unknown Server Response, probably an error. Status was {}, Body was {:?}", status_code, String::from_utf8(body)))),
 		}
 	}
 
-	pub fn find_child(&mut self, parent: &str, name: &str) -> Result<Option<String>> {
-		if let Some(id) = self.fetch_from_node_cache(parent, name) {
+	pub fn find_child(&mut self, parent: &NodeId, name: &str) -> Result<Option<NodeId>> {
+		if let Some(id) = try!(self.fetch_from_node_cache(parent, name)) {
 			return Ok(Some(id));
 		}
 
 		let request = RestBuilder::get(&self.endpoint.metadata_url)
 			.url_push("nodes")
-			.url_push(parent)
+			.url_push(&parent.0)
 			.url_push("children")
 			.url_query(&[("filters", "name:".to_owned() + name)])
 			.authorization(&self.authorization.access_token.clone().unwrap());
@@ -396,15 +436,17 @@ impl AmazonCloudDrive {
 				if response.data.len() == 0 {
 					return Ok(None);
 				}
-				self.insert_into_node_cache(parent, name, &response.data[0].id);
-				Ok(Some(response.data[0].id.clone()))
+				try!(self.insert_into_node_cache(parent, name, &response.data[0].id));
+				Ok(Some(NodeId(response.data[0].id.clone())))
 			},
 			_ => return Err(Error::UnknownServerError(format!("Unknown Server Response, probably an error. Status was {}, Body was {:?}", status_code, String::from_utf8(body)))),
 		}
 	}
 
-	pub fn find_path<P: AsRef<Path>>(&mut self, parent: Option<&str>, path: P) -> Result<Option<String>> {
-		let mut current_dir = parent.map(|s| s.to_owned()).unwrap_or(self.root_id.clone());
+	/// Find a node using an absolute or relative path.
+	/// Returns None if the path could not be found.
+	pub fn find_path<P: AsRef<Path>>(&mut self, parent: Option<&NodeId>, path: P) -> Result<Option<NodeId>> {
+		let mut current_dir = parent.unwrap_or(&self.root_id).clone();
 
 		for p in path.as_ref().components() {
 			match p {
@@ -424,7 +466,10 @@ impl AmazonCloudDrive {
 		Ok(Some(current_dir))
 	}
 
-	pub fn upload(&mut self, parent: Option<&str>, name: &str, data: &[u8], content_type: Option<mime::Mime>) -> Result<String> {
+	/// Upload `data` to ACD with filename `name` under parent `parent`.  The NodeId for the new file
+	/// is returned.  If we return successfully, the file is guaranteed to have been uploaded without
+	/// corruption, at least within the guarantees provided by Amazon Cloud Drive.
+	pub fn upload(&mut self, parent: Option<&NodeId>, name: &str, data: &[u8], content_type: Option<mime::Mime>) -> Result<NodeId> {
 		#[derive(RustcEncodable)]
 		struct UploadMetadata {
 			name: String,
@@ -434,24 +479,23 @@ impl AmazonCloudDrive {
 
 		let calculated_md5 = {
 			let mut md5 = Md5::new();
-			let mut result = [0u8; 16];
 			md5.input(data);
-			md5.result(&mut result);
-			result.to_hex().to_lowercase()
+			md5.result_str().to_lowercase()
 		};
 
-		let parent = parent.unwrap_or(&self.root_id.clone()).to_owned();
+		let parent = parent.unwrap_or(&self.root_id).clone();
 
 		let metadata = UploadMetadata {
 			name: name.to_owned(),
 			kind: "FILE".to_owned(),
-			parents: vec![parent.to_owned()],
+			parents: vec![parent.0.clone()],
 		};
 
 		let content_type = content_type.unwrap_or("application/octect-stream".parse().unwrap());
 
 		let request = RestBuilder::post(&self.endpoint.content_url)
 			.url_push("nodes")
+			.url_query(&[("suppress", "deduplication")])
 			.authorization(&self.authorization.access_token.clone().unwrap())
 			.multipart_data("metadata", json::encode(&metadata).unwrap().as_bytes(), None, None)
 			.multipart_data("content", data, Some(name.to_owned()), Some(content_type));
@@ -467,9 +511,9 @@ impl AmazonCloudDrive {
 					// TODO: Handle this by deleting the file and returning an error
 				}
 
-				self.insert_into_node_cache(&parent, name, &response.id);
+				try!(self.insert_into_node_cache(&parent, name, &response.id));
 
-				Ok(response.id)
+				Ok(NodeId(response.id))
 			},
 			hyper::status::StatusCode::Conflict => Err(Error::NodeExists),
 			_ => Err(Error::UnknownServerError(format!("Unknown Server Response, probably an error. Status was {}, Body was {:?}", status_code, String::from_utf8(body)))),
@@ -478,7 +522,8 @@ impl AmazonCloudDrive {
 
 	/// Create directory if it doesn't exist.
 	/// Returns id for created/existing directory.
-	pub fn mkdir(&mut self, parent: Option<&str>, name: &str) -> Result<String> {
+	/// If parent is None then parent will be the root node.
+	pub fn mkdir(&mut self, parent: Option<&NodeId>, name: &str) -> Result<NodeId> {
 		#[derive(RustcEncodable)]
 		struct Metadata {
 			name: String,
@@ -502,16 +547,16 @@ impl AmazonCloudDrive {
 			info: ConflictResponseInfo,
 		}
 
-		let parent = parent.unwrap_or(&self.root_id.clone()).to_owned();
+		let parent = parent.unwrap_or(&self.root_id).clone();
 
-		if let Some(id) = self.fetch_from_node_cache(&parent, name) {
+		if let Some(id) = try!(self.fetch_from_node_cache(&parent, name)) {
 			return Ok(id);
 		}
 
 		let metadata = Metadata {
 			name: name.to_owned(),
 			kind: "FOLDER".to_owned(),
-			parents: vec![parent.to_owned()],
+			parents: vec![parent.0.clone()],
 		};
 
 		let request = RestBuilder::post(&self.endpoint.metadata_url)
@@ -524,13 +569,13 @@ impl AmazonCloudDrive {
 		match status_code {
 			hyper::status::StatusCode::Created => {
 				let response: Response = try!(decode_server_json(&body));
-				self.insert_into_node_cache(&parent, name, &response.id);
-				Ok(response.id)
+				try!(self.insert_into_node_cache(&parent, name, &response.id));
+				Ok(NodeId(response.id))
 			},
 			hyper::status::StatusCode::Conflict => {
 				let response: ConflictResponse = try!(decode_server_json(&body));
-				self.insert_into_node_cache(&parent, name, &response.info.nodeId);
-				Ok(response.info.nodeId)
+				try!(self.insert_into_node_cache(&parent, name, &response.info.nodeId));
+				Ok(NodeId(response.info.nodeId))
 			},
 			_ => Err(Error::UnknownServerError(format!("Unknown Server Response, probably an error. Status was {}, Body was {:?}", status_code, String::from_utf8(body)))),
 		}
@@ -538,8 +583,8 @@ impl AmazonCloudDrive {
 
 	/// Create all directories in path if they don't exist
 	/// Returns id for the last directory in the path
-	pub fn mkdir_all<P: AsRef<Path>>(&mut self, parent: Option<&str>, path: P) -> Result<String> {
-		let mut current_dir = parent.map(|s| s.to_owned()).unwrap_or(self.root_id.clone());
+	pub fn mkdir_all<P: AsRef<Path>>(&mut self, parent: Option<&NodeId>, path: P) -> Result<NodeId> {
+		let mut current_dir = parent.unwrap_or(&self.root_id).clone();
 
 		for p in path.as_ref().components() {
 			match p {
@@ -556,14 +601,14 @@ impl AmazonCloudDrive {
 		Ok(current_dir)
 	}
 
-	pub fn ls(&mut self, parent: &str) -> Result<Vec<String>> {
+	pub fn ls(&mut self, parent: &NodeId) -> Result<Vec<NodeId>> {
 		let mut ids = Vec::new();
 		let mut next_token = None;
 
 		loop {
 			let request = RestBuilder::get(&self.endpoint.metadata_url)
 				.url_push("nodes")
-				.url_push(parent)
+				.url_push(&parent.0)
 				.url_push("children")
 				.authorization(&self.authorization.access_token.clone().unwrap());
 			let request = match next_token {
@@ -574,13 +619,14 @@ impl AmazonCloudDrive {
 
 			let response: NodesResponse = match status_code {
 				StatusCode::Ok => {
+					println!("DEBUG: {}", String::from_utf8(body.clone()).unwrap());
 					try!(decode_server_json(&body))
 				},
 				_ => return Err(Error::UnknownServerError(format!("Unknown Server Response, probably an error. Status was {}, Body was {:?}", status_code, String::from_utf8(body)))),
 			};
 
 			for node in response.data {
-				ids.push(node.id.clone())
+				ids.push(NodeId(node.id.clone()))
 			}
 
 			match response.nextToken {
@@ -592,9 +638,9 @@ impl AmazonCloudDrive {
 		Ok(ids)
 	}
 
-	pub fn download(&mut self, id: &str) -> Result<Vec<u8>> {
+	pub fn download(&mut self, id: &NodeId) -> Result<Vec<u8>> {
 		let request = RestBuilder::get(&self.endpoint.content_url)
-			.url_push("nodes").url_push(id).url_push("content")
+			.url_push("nodes").url_push(&id.0).url_push("content")
 			.authorization(&self.authorization.access_token.clone().unwrap());
 		let (status_code, body) = try!(self.get_server_response(request, true, DEFAULT_RETRY));
 
@@ -603,24 +649,37 @@ impl AmazonCloudDrive {
 			_ => return Err(Error::UnknownServerError(format!("Unknown Server Response, probably an error. Status was {}, Body was {:?}", status_code, String::from_utf8(body)))),
 		}
 	}
-}
 
+	/// Delete a node.
+	/// NOTE: This only sends the node to the Trash.  The user needs to manually empty their trash.
+	pub fn rm(&mut self, node: &NodeId) -> Result<()> {
+		let request = RestBuilder::put(&self.endpoint.metadata_url)
+			.url_push("trash")
+			.url_push(&node.0)
+			.authorization(&self.authorization.access_token.clone().unwrap());
 
-fn read_json_file<T: Decodable>(path: &str) -> Option<T> {
-	match File::open(path) {
-		Ok(mut f) => {
-			let mut s = String::new();
-			f.read_to_string(&mut s).unwrap();
-			json::decode(&s).unwrap()
-		},
-		Err(_) => None,
+		let (status_code, body) = try!(self.get_server_response(request, true, DEFAULT_RETRY));
+
+		match status_code {
+			hyper::status::StatusCode::Ok => Ok(()),
+			_ => Err(Error::UnknownServerError(format!("Unknown Server Response, probably an error. Status was {}, Body was {:?}", status_code, String::from_utf8(body)))),
+		}
 	}
 }
 
 
-fn write_json_file<T: Encodable>(path: &str, value: &T) {
-	let mut f = File::create(path).unwrap();
-	f.write_all (&json::encode(value).unwrap().into_bytes()).unwrap();
+fn read_json_file<T: Decodable, P: AsRef<Path>>(path: P) -> Result<T> {
+	let mut f = try!(File::open(path));
+	let mut s = String::new();
+	try!(f.read_to_string(&mut s));
+	Ok(try!(json::decode(&s)))
+}
+
+
+fn write_json_file<T: Encodable, P: AsRef<Path>>(path: P, value: &T) -> Result<()> {
+	let mut f = try!(File::create(path));
+	try!(f.write_all (&try!(json::encode(value)).into_bytes()));
+	Ok(())
 }
 
 
@@ -638,4 +697,54 @@ fn decode_server_json<T: Decodable>(s: &[u8]) -> Result<T> {
 
 fn open_webbrowser(url: &str) {
 	Command::new("xdg-open").arg(url).output().unwrap();
+}
+
+
+#[cfg(test)]
+mod test {
+	use super::{Client, read_json_file, SecurityProfile};
+	use super::Error as AcdError;
+	use tempdir::TempDir;
+	use std::path::Path;
+	use rand::{self, Rng};
+
+	#[test]
+	fn test_everything() {
+		let security_profile: SecurityProfile = read_json_file("test.security_profile.json").unwrap();
+		let temp_config_dir = TempDir::new("rust-acd-test").unwrap();
+		let temp_upload_dir = temp_config_dir.path().file_name().unwrap();
+		let mut client = Client::new(&security_profile.client_id, &security_profile.client_secret, temp_config_dir.path()).unwrap();
+		println!("temp_upload_dir: {:?}", temp_upload_dir);
+
+		// Test mkdir_all
+		let mkdir_test_dir = client.mkdir_all(None, Path::new("/").join(temp_upload_dir).join("mkdir_test")).unwrap();
+		let temp_upload_dir = client.find_path(None, Path::new("/").join(temp_upload_dir)).unwrap().unwrap();
+
+		// Test upload
+		let small_data: Vec<u8> = rand::thread_rng().gen_iter().take(4).collect();
+		let large_data: Vec<u8> = rand::thread_rng().gen_iter().take(1024*1024).collect();
+		let small_data_node = client.upload(Some(&mkdir_test_dir), "small_data", &small_data, None).unwrap();
+		let large_data_node = client.upload(Some(&mkdir_test_dir), "large_data", &large_data, None).unwrap();
+
+		// Test find_path
+		assert_eq!(client.find_path(Some(&temp_upload_dir), Path::new("mkdir_test").join("small_data")).unwrap().unwrap(), small_data_node);
+
+		// Test download
+		assert_eq!(client.download(&small_data_node).unwrap(), small_data);
+		assert_eq!(client.download(&large_data_node).unwrap(), large_data);
+
+		// Test conflict
+		match client.upload(Some(&mkdir_test_dir), "small_data", b"if you see this text, something is broken", None) {
+			Err(AcdError::NodeExists) => (),
+			_ => panic!("upload should throw an error if we try to specify a filename that already exists."),
+		}
+
+		// Test ls
+		let ls_result = client.ls(&mkdir_test_dir).unwrap();
+		assert_eq!(ls_result.len(), 2);
+		assert!((ls_result[0] == small_data_node && ls_result[1] == large_data_node) || (ls_result[0] == large_data_node && ls_result[1] == small_data_node));
+
+		// Cleanup
+		client.rm(&temp_upload_dir).unwrap();
+	}
 }

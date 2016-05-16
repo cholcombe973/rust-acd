@@ -39,6 +39,10 @@ impl RestBuilder {
 		RestBuilder::new(hyper::method::Method::Post, url)
 	}
 
+	pub fn put(url: &str) -> RestBuilder {
+		RestBuilder::new(hyper::method::Method::Put, url)
+	}
+
 	pub fn new(method: hyper::method::Method, url: &str) -> RestBuilder {
 		RestBuilder {
 			method: method,

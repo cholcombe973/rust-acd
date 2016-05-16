@@ -2,6 +2,9 @@ use std::error::Error as StdError;
 use hyper::error::Error as HyperError;
 use std::io::Error as IoError;
 use rustc_serialize::json::DecoderError as JsonError;
+use rusqlite::Error as SqliteError;
+use rustc_serialize::json::EncoderError as JsonEncoderError;
+use rustc_serialize::json::DecoderError as JsonDecoderError;
 use std::fmt;
 
 
@@ -15,6 +18,12 @@ pub enum Error {
 	Hyper(HyperError),
 	/// I/O error
 	Io(IoError),
+	/// Error from rusqlite
+	Sqlite(SqliteError),
+	/// Error from the JSON encoder
+	JsonEncoder(JsonEncoderError),
+	/// Error from the JSON decoder
+	JsonDecoder(JsonDecoderError),
 	/// Invalid path.  The path specified could not be parsed.
 	BadPath,
 	/// Server response was expected to be a string, but we couldn't decode it as UTF-8
@@ -38,6 +47,9 @@ impl StdError for Error {
 		match *self {
 			Hyper(ref e) => e.description(),
 			Io(ref e) => e.description(),
+			Sqlite(ref e) => e.description(),
+			JsonEncoder(ref e) => e.description(),
+			JsonDecoder(ref e) => e.description(),
 			BadPath => "Invalid path provided",
 			ResponseNotUtf8(_) => "Server response was supposed to be UTF-8, but wasn't",
 			ResponseBadJson(ref e) => e.description(),
@@ -50,6 +62,9 @@ impl StdError for Error {
 		match *self {
 			Hyper(ref error) => Some(error),
 			Io(ref error) => Some(error),
+			Sqlite(ref error) => Some(error),
+			JsonEncoder(ref error) => Some(error),
+			JsonDecoder(ref error) => Some(error),
 			BadPath => None,
 			ResponseNotUtf8(_) => None,
 			ResponseBadJson(ref error) => Some(error),
@@ -68,5 +83,23 @@ impl From<HyperError> for Error {
 impl From<IoError> for Error {
 	fn from(err: IoError) -> Error {
 		Io(err)
+	}
+}
+
+impl From<SqliteError> for Error {
+	fn from(err: SqliteError) -> Error {
+		Sqlite(err)
+	}
+}
+
+impl From<JsonEncoderError> for Error {
+	fn from(err: JsonEncoderError) -> Error {
+		JsonEncoder(err)
+	}
+}
+
+impl From<JsonDecoderError> for Error {
+	fn from(err: JsonDecoderError) -> Error {
+		JsonDecoder(err)
 	}
 }
