@@ -27,6 +27,8 @@ pub enum Error {
 	JsonDecoder(JsonDecoderError),
 	/// Url Parse Error
 	UrlParse(UrlParseError),
+	/// Need a new access token
+	ExpiredToken,
 	/// Bad Authentication URL
 	BadAuthUrl,
 	/// Invalid path.  The path specified could not be parsed.
@@ -37,6 +39,8 @@ pub enum Error {
 	ResponseBadJson(JsonError),
 	/// Server's response was not as expected, probably an error
 	UnknownServerError(String),
+	/// The server returned a 5xx status code
+	ServerError(String),
 	/// Node (file/directory) exists
 	NodeExists,
 }
@@ -56,11 +60,13 @@ impl StdError for Error {
 			JsonEncoder(ref e) => e.description(),
 			JsonDecoder(ref e) => e.description(),
 			UrlParse(ref e) => e.description(),
+			ExpiredToken => "Access Token Expired",
 			BadPath => "Invalid path provided",
 			BadAuthUrl => "Invalid authorization URL provided",
 			ResponseNotUtf8(_) => "Server response was supposed to be UTF-8, but wasn't",
 			ResponseBadJson(ref e) => e.description(),
 			UnknownServerError(ref e) => e,
+			ServerError(ref e) => e,
 			NodeExists => "Node exists",
 		}
 	}
@@ -73,11 +79,13 @@ impl StdError for Error {
 			JsonEncoder(ref error) => Some(error),
 			JsonDecoder(ref error) => Some(error),
 			UrlParse(ref error) => Some(error),
+			ExpiredToken => None,
 			BadPath => None,
 			BadAuthUrl => None,
 			ResponseNotUtf8(_) => None,
 			ResponseBadJson(ref error) => Some(error),
 			UnknownServerError(_) => None,
+			ServerError(_) => None,
 			NodeExists => None,
 		}
 	}

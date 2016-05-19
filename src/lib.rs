@@ -31,10 +31,12 @@ use hyper::http;
 use hyper::client::pool::Pool;
 use std::path::PathBuf;
 use std::str;
+use rand::Rng;
+use std::cmp;
 
 
 /// How many times we retry contacting Amazon after a server error
-const DEFAULT_RETRY: u8 = 5;
+const MAXIMUM_RETRY: u32 = 5;
 /// How many hours to hold onto an endpoint (after which the endpoint is refreshed)
 const REFRESH_ENDPOINT_TIME: i64 = 3*24;
 
@@ -158,6 +160,7 @@ impl Client {
 		// Right now this should be good enough, and it's unlikely that the endpoint will change anyway.
 		try!(acd.refresh_endpoint());
 		acd.root_id = try!(acd.find_root());
+
 		Ok(acd)
 	}
 
@@ -193,36 +196,73 @@ impl Client {
 		}
 	}
 
-	// TODO: Accept a list of StatusCodes that should be considered OK.
-	fn get_server_response(&mut self, rest: RestBuilder, repeat: bool, retry: u8) -> Result<(hyper::status::StatusCode, Vec<u8>)> {
+	// Make the request to the server and get the response.
+	// If there's a server error, try again using the recommended backoff method.
+	// If our access token has expired, we will attempt renew it.
+	fn get_server_response_with_retry(&mut self, rest: RestBuilder, authorize: bool) -> Result<(StatusCode, Vec<u8>)> {
+		let mut retry_count = 0;
+
+		loop {
+			let rest_copy = rest.clone();
+			let rest_copy = if authorize {
+				rest_copy.authorization(&(self.authorization.access_token.clone()))
+			} else {
+				rest_copy
+			};
+
+			// Backoff
+			if retry_count > 0 {
+				let backoff = rand::thread_rng().gen_range(0, 1000 * (1 << (cmp::min(retry_count - 1, 8))));
+				std::thread::sleep(Duration::from_millis(backoff));
+			}
+
+			let (status_code, body) = match self.get_server_response(rest_copy) {
+				Ok((status_code, body)) => (status_code, body),
+				Err(Error::ExpiredToken) => if authorize {
+					// Need reauthentication
+					try!(self.refresh_authorization());
+					retry_count = 0;  // Successful authorization means we got a successful response from the server, so reset the retry_count.
+					continue;
+				} else {
+					// Server told us our access token was expired, but we didn't provide one...
+					return Err(Error::ServerError(format!("Server reported Expired Token on a call that didn't have a token.")));
+				},
+				Err(err) => {
+					// Communication error, retry
+					retry_count += 1;
+					if retry_count >= MAXIMUM_RETRY {
+						return Err(err);
+					}
+					println!("INFO: Communication Error, will retry: {:?}", err);
+					continue;
+				}
+			};
+
+			// Server errors will cause us to retry.  All other errors just return.
+			if status_code.class() == hyper::status::StatusClass::ServerError {
+				retry_count += 1;
+				if retry_count >= MAXIMUM_RETRY {
+					return Err(Error::ServerError(format!("Status was {}, Body was {:?}", status_code, String::from_utf8(body))));
+				}
+				println!("INFO: Server Error, will retry: Status Code: {:?}", status_code);
+				continue;
+			}
+
+			return Ok((status_code, body));
+		}
+	}
+
+	// Make the request to the server and get the response.
+	fn get_server_response(&mut self, rest: RestBuilder) -> Result<(StatusCode, Vec<u8>)> {
 		#[derive(RustcDecodable, Debug)]
 		struct MessageResponse {
 			message: String,
 		}
 
-		let rest_copy = rest.clone();
-		let mut response = match rest.send(&self.protocol) {
-			Ok(r) => r,
-			Err(err) => if retry > 0 {
-				println!("INFO: Error during request: Retries left: {}", retry);
-				std::thread::sleep(Duration::from_secs(5));
-				return self.get_server_response(rest_copy, repeat, retry - 1);
-			} else {
-				return Err(error::Error::from(err))
-			},
-		};
+		let mut response = try!(rest.send(&self.protocol));
 
 		let mut body = vec![0u8; 0];
-		match response.read_to_end(&mut body) {
-			Ok(_) => (),
-			Err(err) => if retry > 0 {
-				println!("INFO: Error during request: Retries left: {}", retry);
-				std::thread::sleep(Duration::from_secs(5));
-				return self.get_server_response(rest_copy, repeat, retry - 1);
-			} else {
-				return Err(error::Error::from(err))
-			},
-		};
+		try!(response.read_to_end(&mut body));
 
 		if response.status.is_success() {
 			return Ok((response.status, body));
@@ -241,28 +281,10 @@ impl Client {
 		// 400 Bad Request, with a JSON message saying the status code was 401 and that the token had expired.
 		// ...Whut?
 		// So don't analyze status code; just check for "Token has expired"
-		let need_reauth = match body_json {
-			Some(msg) => msg.message.contains("Token has expired"),
-			_ => false,
-		};
-
-		if need_reauth && repeat {
-			/* Re-authorize */
-			try!(self.refresh_authorization());
-			/* Try again */
-			let rest_copy = rest_copy.authorization(&(self.authorization.access_token.clone()));
-			return self.get_server_response(rest_copy, false, retry);
-		}
-
-		// If we need to reauth, but we've tried that already, error out.
-		if need_reauth {
-			return Ok((response.status, body));
-		}
-
-		if retry > 0 {
-			println!("INFO: Amazon returned status {:?}: Retries left: {}", response.status, retry);
-			std::thread::sleep(Duration::from_secs(5));
-			return self.get_server_response(rest_copy, repeat, retry - 1);
+		if let Some(msg) = body_json {
+			if msg.message.contains("Token has expired") {
+				return Err(Error::ExpiredToken)
+			}
 		}
 
 		Ok((response.status, body))
@@ -283,9 +305,8 @@ impl Client {
 			return Ok(())
 		}
 
-		let request = RestBuilder::get("https://drive.amazonaws.com/drive/v1/account/endpoint")
-			.authorization(&(self.authorization.access_token.clone()));
-		let (status_code, body) = try!(self.get_server_response(request, true, DEFAULT_RETRY));
+		let request = RestBuilder::get("https://drive.amazonaws.com/drive/v1/account/endpoint");
+		let (status_code, body) = try!(self.get_server_response_with_retry(request, true));
 
 		let response: AccountEndpointResponse = match status_code {
 			StatusCode::Ok => {
@@ -336,7 +357,7 @@ impl Client {
 				("client_secret", &self.security_profile.client_secret),
 				("redirect_uri", "http://localhost:26619/")
 			]);
-		let (status_code, body) = try!(self.get_server_response(request, false, DEFAULT_RETRY));
+		let (status_code, body) = try!(self.get_server_response_with_retry(request, false));
 
 		let response: O2TokenResponse = match status_code {
 				StatusCode::Ok => {
@@ -368,7 +389,7 @@ impl Client {
 				("client_secret", &self.security_profile.client_secret),
 				("redirect_uri", "http://localhost:26619/")
 			]);
-		let (status_code, body) = try!(self.get_server_response(request, false, DEFAULT_RETRY));
+		let (status_code, body) = try!(self.get_server_response_with_retry(request, false));
 
 		let response: O2TokenResponse = match status_code {
 			StatusCode::Ok => {
@@ -392,10 +413,9 @@ impl Client {
 	fn find_root(&mut self) -> Result<NodeId> {
 		let request = RestBuilder::get(&self.endpoint.metadata_url.clone())
 			.url_push("nodes")
-			.url_query(&[("filters", "kind:FOLDER AND isRoot:true")])
-			.authorization(&self.authorization.access_token.clone());
+			.url_query(&[("filters", "kind:FOLDER AND isRoot:true")]);
 
-		let (status_code, body) = try!(self.get_server_response(request, true, DEFAULT_RETRY));
+		let (status_code, body) = try!(self.get_server_response_with_retry(request, true));
 
 		match status_code {
 			StatusCode::Ok => {
@@ -415,9 +435,8 @@ impl Client {
 			.url_push("nodes")
 			.url_push(&parent.0)
 			.url_push("children")
-			.url_query(&[("filters", "name:".to_owned() + name)])
-			.authorization(&self.authorization.access_token.clone());
-		let (status_code, body) = try!(self.get_server_response(request, true, DEFAULT_RETRY));
+			.url_query(&[("filters", "name:".to_owned() + name)]);
+		let (status_code, body) = try!(self.get_server_response_with_retry(request, true));
 
 		match status_code {
 			StatusCode::Ok => {
@@ -497,14 +516,13 @@ impl Client {
 		let request = RestBuilder::post(&self.endpoint.content_url)
 			.url_push("nodes")
 			.url_query(&[("suppress", "deduplication")])
-			.authorization(&self.authorization.access_token.clone())
 			.multipart_data("metadata", try!(json::encode(&metadata)).as_bytes(), None, None)
 			.multipart_data("content", data, Some(name.to_owned()), Some(content_type));
 
-		let (status_code, body) = try!(self.get_server_response(request, true, DEFAULT_RETRY));
+		let (status_code, body) = try!(self.get_server_response_with_retry(request, true));
 
 		match status_code {
-			hyper::status::StatusCode::Created => {
+			StatusCode::Created => {
 				let response: NodeUploadResponse = try!(decode_server_json(&body));
 
 				if response.contentProperties.md5.to_lowercase() != calculated_md5 {
@@ -516,7 +534,7 @@ impl Client {
 
 				Ok(NodeId(response.id))
 			},
-			hyper::status::StatusCode::Conflict => Err(Error::NodeExists),
+			StatusCode::Conflict => Err(Error::NodeExists),
 			_ => Err(Error::UnknownServerError(format!("Unknown Server Response, probably an error. Status was {}, Body was {:?}", status_code, String::from_utf8(body)))),
 		}
 	}
@@ -562,18 +580,17 @@ impl Client {
 
 		let request = RestBuilder::post(&self.endpoint.metadata_url)
 			.url_push("nodes")
-			.authorization(&self.authorization.access_token.clone())
 			.body(try!(json::encode(&metadata)).as_bytes());
 
-		let (status_code, body) = try!(self.get_server_response(request, true, DEFAULT_RETRY));
+		let (status_code, body) = try!(self.get_server_response_with_retry(request, true));
 
 		match status_code {
-			hyper::status::StatusCode::Created => {
+			StatusCode::Created => {
 				let response: Response = try!(decode_server_json(&body));
 				try!(self.insert_into_node_cache(&parent, name, &response.id));
 				Ok(NodeId(response.id))
 			},
-			hyper::status::StatusCode::Conflict => {
+			StatusCode::Conflict => {
 				let response: ConflictResponse = try!(decode_server_json(&body));
 				try!(self.insert_into_node_cache(&parent, name, &response.info.nodeId));
 				Ok(NodeId(response.info.nodeId))
@@ -610,13 +627,12 @@ impl Client {
 			let request = RestBuilder::get(&self.endpoint.metadata_url)
 				.url_push("nodes")
 				.url_push(&parent.0)
-				.url_push("children")
-				.authorization(&self.authorization.access_token.clone());
+				.url_push("children");
 			let request = match next_token {
 				Some(token) => request.url_query(&[("startToken", token)]),
 				None => request,
 			};
-			let (status_code, body) = try!(self.get_server_response(request, true, DEFAULT_RETRY));
+			let (status_code, body) = try!(self.get_server_response_with_retry(request, true));
 
 			let response: NodesResponse = match status_code {
 				StatusCode::Ok => {
@@ -640,9 +656,8 @@ impl Client {
 
 	pub fn download(&mut self, id: &NodeId) -> Result<Vec<u8>> {
 		let request = RestBuilder::get(&self.endpoint.content_url)
-			.url_push("nodes").url_push(&id.0).url_push("content")
-			.authorization(&self.authorization.access_token.clone());
-		let (status_code, body) = try!(self.get_server_response(request, true, DEFAULT_RETRY));
+			.url_push("nodes").url_push(&id.0).url_push("content");
+		let (status_code, body) = try!(self.get_server_response_with_retry(request, true));
 
 		match status_code {
 			StatusCode::Ok => Ok(body),
@@ -655,13 +670,12 @@ impl Client {
 	pub fn rm(&mut self, node: &NodeId) -> Result<()> {
 		let request = RestBuilder::put(&self.endpoint.metadata_url)
 			.url_push("trash")
-			.url_push(&node.0)
-			.authorization(&self.authorization.access_token.clone());
+			.url_push(&node.0);
 
-		let (status_code, body) = try!(self.get_server_response(request, true, DEFAULT_RETRY));
+		let (status_code, body) = try!(self.get_server_response_with_retry(request, true));
 
 		match status_code {
-			hyper::status::StatusCode::Ok => Ok(()),
+			StatusCode::Ok => Ok(()),
 			_ => Err(Error::UnknownServerError(format!("Unknown Server Response, probably an error. Status was {}, Body was {:?}", status_code, String::from_utf8(body)))),
 		}
 	}
@@ -739,6 +753,9 @@ mod test {
 			Err(AcdError::NodeExists) => (),
 			_ => panic!("upload should throw an error if we try to specify a filename that already exists."),
 		}
+
+		// Test handling missing files
+		assert!(client.find_path(Some(&temp_upload_dir), Path::new("thisdoesntexist")).unwrap().is_none());
 
 		// Test ls
 		let ls_result = client.ls(&mkdir_test_dir).unwrap();
