@@ -239,7 +239,8 @@ impl Client {
 			};
 
 			// Server errors will cause us to retry.  All other errors just return.
-			if status_code.class() == hyper::status::StatusClass::ServerError {
+			// Also catch 429 (Too Many Requests)
+			if status_code.class() == hyper::status::StatusClass::ServerError || status_code == StatusCode::TooManyRequests {
 				retry_count += 1;
 				if retry_count >= MAXIMUM_RETRY {
 					return Err(Error::ServerError(format!("Status was {}, Body was {:?}", status_code, String::from_utf8(body))));
