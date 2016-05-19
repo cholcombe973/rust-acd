@@ -7,9 +7,9 @@ repository = "https://github.com/fpgaminer/rust-acd"
 version = "0.1.0"
 
 [dependencies]
-hyper = "^0.7"
-mime = "^0.1"
-multipart = "^0.4"
+hyper = "^0.8"
+mime = "^0.2"
+multipart = "^0.7"
 rand = "0.3"
 rusqlite = "^0.6"
 rust-crypto = "^0.2"

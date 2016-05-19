@@ -5,6 +5,7 @@ use rustc_serialize::json::DecoderError as JsonError;
 use rusqlite::Error as SqliteError;
 use rustc_serialize::json::EncoderError as JsonEncoderError;
 use rustc_serialize::json::DecoderError as JsonDecoderError;
+use url::ParseError as UrlParseError;
 use std::fmt;
 
 
@@ -24,6 +25,10 @@ pub enum Error {
 	JsonEncoder(JsonEncoderError),
 	/// Error from the JSON decoder
 	JsonDecoder(JsonDecoderError),
+	/// Url Parse Error
+	UrlParse(UrlParseError),
+	/// Bad Authentication URL
+	BadAuthUrl,
 	/// Invalid path.  The path specified could not be parsed.
 	BadPath,
 	/// Server response was expected to be a string, but we couldn't decode it as UTF-8
@@ -50,7 +55,9 @@ impl StdError for Error {
 			Sqlite(ref e) => e.description(),
 			JsonEncoder(ref e) => e.description(),
 			JsonDecoder(ref e) => e.description(),
+			UrlParse(ref e) => e.description(),
 			BadPath => "Invalid path provided",
+			BadAuthUrl => "Invalid authorization URL provided",
 			ResponseNotUtf8(_) => "Server response was supposed to be UTF-8, but wasn't",
 			ResponseBadJson(ref e) => e.description(),
 			UnknownServerError(ref e) => e,
@@ -65,7 +72,9 @@ impl StdError for Error {
 			Sqlite(ref error) => Some(error),
 			JsonEncoder(ref error) => Some(error),
 			JsonDecoder(ref error) => Some(error),
+			UrlParse(ref error) => Some(error),
 			BadPath => None,
+			BadAuthUrl => None,
 			ResponseNotUtf8(_) => None,
 			ResponseBadJson(ref error) => Some(error),
 			UnknownServerError(_) => None,
@@ -101,5 +110,11 @@ impl From<JsonEncoderError> for Error {
 impl From<JsonDecoderError> for Error {
 	fn from(err: JsonDecoderError) -> Error {
 		JsonDecoder(err)
+	}
+}
+
+impl From<UrlParseError> for Error {
+	fn from(err: UrlParseError) -> Error {
+		UrlParse(err)
 	}
 }

@@ -90,14 +90,14 @@ impl RestBuilder {
 		self
 	}
 
-	pub fn multipart_urlencoded<I, K, V>(self, name: &str, query_pairs: I) -> RestBuilder where
+	/*pub fn multipart_urlencoded<I, K, V>(self, name: &str, query_pairs: I) -> RestBuilder where
 		I: IntoIterator,
 		I::Item: Borrow<(K, V)>,
 		K: AsRef<str>,
 		V: AsRef<str>
 	{
 		self.multipart_data(name, form_urlencoded::serialize(query_pairs).as_bytes(), None, None)
-	}
+	}*/
 
 	pub fn multipart_data(mut self, name: &str, data: &[u8], filename: Option<String>, content_type: Option<Mime>) -> RestBuilder {
 		self.multiparts.push(RestBuilderMultipartPart {
@@ -115,7 +115,6 @@ impl RestBuilder {
 			try!(protocol.new_message(&host, port, &*self.url.scheme))
 		};
 
-		//let mut request = try!(Request::new(self.method, self.url));
 		let mut request = try!(Request::with_message(self.method, self.url, message));
 
 		try!(request.set_write_timeout(Some(Duration::from_secs(30))));
@@ -135,8 +134,8 @@ impl RestBuilder {
 			for part in self.multiparts {
 				let mut cursor = Cursor::new(part.data);
 				match part.filename {
-					Some(s) => multipart.write_stream(part.name, &mut cursor, Some(&s[..]), part.content_type),
-					None => multipart.write_stream(part.name, &mut cursor, None, part.content_type),
+					Some(s) => try!(multipart.write_stream(part.name, &mut cursor, Some(&s[..]), part.content_type)),
+					None => try!(multipart.write_stream(part.name, &mut cursor, None, part.content_type)),
 				};
 			}
 			multipart.send()
