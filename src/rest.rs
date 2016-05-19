@@ -1,6 +1,5 @@
 use mime::Mime;
 use hyper::{self, header};
-use hyper::method::Method;
 use hyper::client::request::Request;
 use hyper::http::Protocol;
 use multipart::client::Multipart;

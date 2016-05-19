@@ -526,8 +526,11 @@ impl Client {
 				let response: NodeUploadResponse = try!(decode_server_json(&body));
 
 				if response.contentProperties.md5.to_lowercase() != calculated_md5 {
-					panic!("UH OH!!!! During an upload Amazon returned a bad MD5. This is very bad. We don't handle this case. Oh dear...");
-					// TODO: Handle this by deleting the file and returning an error
+					// MD5 Mismatch.  This is very bad.  Let's try to delete the file.
+					return match self.rm(&NodeId(response.id)) {
+						Ok(_) => Err(Error::UnknownServerError(format!("MD5 Mismatch. This should never happen, so it looks like Amazon's server hit a bug.  File was not upload."))),
+						Err(_) => Err(Error::MD5Mismatch),
+					};
 				}
 
 				try!(self.insert_into_node_cache(&parent, name, &response.id));

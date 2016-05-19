@@ -43,6 +43,9 @@ pub enum Error {
 	ServerError(String),
 	/// Node (file/directory) exists
 	NodeExists,
+	/// MD5 Mismatch during upload.  If this error is thrown, it means there was a mistmatch
+	/// and we failed to delete the file.  So the corrupt file is now on ACD.
+	MD5Mismatch,
 }
 
 impl fmt::Display for Error {
@@ -68,6 +71,7 @@ impl StdError for Error {
 			UnknownServerError(ref e) => e,
 			ServerError(ref e) => e,
 			NodeExists => "Node exists",
+			MD5Mismatch => "MD5 Mismatch. This should never happen, so it looks like Amazon's server hit a bug.  Unable to correct the error!  The corrupted file was uploaded.",
 		}
 	}
 
@@ -87,6 +91,7 @@ impl StdError for Error {
 			UnknownServerError(_) => None,
 			ServerError(_) => None,
 			NodeExists => None,
+			MD5Mismatch => None,
 		}
 	}
 }
