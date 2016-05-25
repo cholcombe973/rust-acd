@@ -83,19 +83,6 @@ struct O2TokenResponse {
 	pub expires_in: u64,
 }
 
-#[derive(RustcDecodable, Debug)]
-struct NodeResponse {
-	pub id: String,
-}
-
-#[derive(RustcDecodable, Debug)]
-#[allow(non_snake_case)]
-struct NodesResponse {
-	pub count: u64,
-	pub nextToken: Option<String>,
-	pub data: Vec<NodeResponse>,
-}
-
 
 impl Client {
 	/// Create a new instances of AmazonCloudDrive.
@@ -412,6 +399,19 @@ impl Client {
 	}
 
 	fn find_root(&mut self) -> Result<NodeId> {
+		#[derive(RustcDecodable, Debug)]
+		struct NodeResponse {
+			id: String,
+		}
+
+		#[derive(RustcDecodable, Debug)]
+		#[allow(non_snake_case)]
+		struct NodesResponse {
+			count: u64,
+			nextToken: Option<String>,
+			data: [NodeResponse; 1],
+		}
+
 		let request = RestBuilder::get(&self.endpoint.metadata_url.clone())
 			.url_push("nodes")
 			.url_query(&[("filters", "kind:FOLDER AND isRoot:true")]);
@@ -428,6 +428,19 @@ impl Client {
 	}
 
 	pub fn find_child(&mut self, parent: &NodeId, name: &str) -> Result<Option<NodeId>> {
+		#[derive(RustcDecodable, Debug)]
+		struct NodeResponse {
+			id: String,
+		}
+
+		#[derive(RustcDecodable, Debug)]
+		#[allow(non_snake_case)]
+		struct NodesResponse {
+			count: u64,
+			nextToken: Option<String>,
+			data: Vec<NodeResponse>,
+		}
+
 		if let Some(id) = try!(self.fetch_from_node_cache(parent, name)) {
 			return Ok(Some(id));
 		}
@@ -623,7 +636,21 @@ impl Client {
 		Ok(current_dir)
 	}
 
-	pub fn ls(&mut self, parent: &NodeId) -> Result<Vec<NodeId>> {
+	pub fn ls(&mut self, parent: &NodeId) -> Result<Vec<(String, NodeId)>> {
+		#[derive(RustcDecodable, Debug)]
+		struct NodeResponse {
+			name: String,
+			id: String,
+		}
+
+		#[derive(RustcDecodable, Debug)]
+		#[allow(non_snake_case)]
+		struct NodesResponse {
+			count: u64,
+			nextToken: Option<String>,
+			data: Vec<NodeResponse>,
+		}
+
 		let mut ids = Vec::new();
 		let mut next_token = None;
 
@@ -646,7 +673,7 @@ impl Client {
 			};
 
 			for node in response.data {
-				ids.push(NodeId(node.id.clone()))
+				ids.push((node.name, NodeId(node.id.clone())))
 			}
 
 			match response.nextToken {
@@ -764,7 +791,10 @@ mod test {
 		// Test ls
 		let ls_result = client.ls(&mkdir_test_dir).unwrap();
 		assert_eq!(ls_result.len(), 2);
-		assert!((ls_result[0] == small_data_node && ls_result[1] == large_data_node) || (ls_result[0] == large_data_node && ls_result[1] == small_data_node));
+		assert!(
+		         (ls_result[0].0 == "small_data" && ls_result[0].1 == small_data_node && ls_result[1].0 == "large_data" && ls_result[1].1 == large_data_node)
+			  || (ls_result[0].0 == "large_data" && ls_result[0].1 == large_data_node && ls_result[1].0 == "small_data" && ls_result[1].1 == small_data_node)
+		);
 
 		// Cleanup
 		client.rm(&temp_upload_dir).unwrap();
