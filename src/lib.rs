@@ -36,7 +36,7 @@ use std::cmp;
 
 
 /// How many times we retry contacting Amazon after a server error
-const MAXIMUM_RETRY: u32 = 5;
+const MAXIMUM_RETRY: u32 = 6;
 /// How many hours to hold onto an endpoint (after which the endpoint is refreshed)
 const REFRESH_ENDPOINT_TIME: i64 = 3*24;
 
@@ -227,7 +227,8 @@ impl Client {
 
 			// Server errors will cause us to retry.  All other errors just return.
 			// Also catch 429 (Too Many Requests)
-			if status_code.class() == hyper::status::StatusClass::ServerError || status_code == StatusCode::TooManyRequests {
+			// Also catch 400 (Bad Request) ... because ACD returns that randomly for no reason
+			if status_code.class() == hyper::status::StatusClass::ServerError || status_code == StatusCode::TooManyRequests || status_code == StatusCode::BadRequest {
 				retry_count += 1;
 				if retry_count >= MAXIMUM_RETRY {
 					return Err(Error::ServerError(format!("Status was {}, Body was {:?}", status_code, String::from_utf8(body))));
