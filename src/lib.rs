@@ -36,7 +36,7 @@ use std::cmp;
 
 
 /// How many times we retry contacting Amazon after a server error
-const MAXIMUM_RETRY: u32 = 6;
+const MAXIMUM_RETRY: u32 = 8;
 /// How many hours to hold onto an endpoint (after which the endpoint is refreshed)
 const REFRESH_ENDPOINT_TIME: i64 = 3*24;
 
