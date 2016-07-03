@@ -35,8 +35,6 @@ use rand::Rng;
 use std::cmp;
 
 
-/// How many times we retry contacting Amazon after a server error
-const MAXIMUM_RETRY: u32 = 8;
 /// How many hours to hold onto an endpoint (after which the endpoint is refreshed)
 const REFRESH_ENDPOINT_TIME: i64 = 3*24;
 
@@ -49,6 +47,8 @@ pub struct Client {
 	root_id: NodeId,
 	cache_connection: rusqlite::Connection,
 	protocol: Box<http::Protocol>,
+	/// How many times we retry contacting Amazon after a server error
+	maximum_retry: u32,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -99,7 +99,7 @@ impl Client {
 	/// When creating a new instance without any pre-existing configuration, the user will be
 	/// prompted to give access to their Amazon Cloud Drive account.  The authorization will be
 	/// saved to the config_dir so it can be re-used in the future and not prompt the user again.
-	pub fn new<P: AsRef<Path>>(client_id: &str, client_secret: &str, config_dir: P) -> Result<Client> {
+	pub fn new<P: AsRef<Path>>(client_id: &str, client_secret: &str, config_dir: P, maximum_retry: u32) -> Result<Client> {
 		let config_dir = config_dir.as_ref().join(".acd");
 
 		// Create configuration directory
@@ -135,6 +135,7 @@ impl Client {
 			root_id: NodeId(String::new()),
 			cache_connection: cache_conn,
 			protocol: Box::new(http::h1::Http11Protocol::with_connector(Pool::new(Default::default()))),
+			maximum_retry: maximum_retry,
 		};
 
 		// If we aren't authorized yet, authorize.
@@ -217,7 +218,7 @@ impl Client {
 				Err(err) => {
 					// Communication error, retry
 					retry_count += 1;
-					if retry_count >= MAXIMUM_RETRY {
+					if retry_count >= self.maximum_retry {
 						return Err(err);
 					}
 					println!("INFO: Communication Error, will retry: {:?}", err);
@@ -230,7 +231,7 @@ impl Client {
 			// Also catch 400 (Bad Request) ... because ACD returns that randomly for no reason
 			if status_code.class() == hyper::status::StatusClass::ServerError || status_code == StatusCode::TooManyRequests || status_code == StatusCode::BadRequest {
 				retry_count += 1;
-				if retry_count >= MAXIMUM_RETRY {
+				if retry_count >= self.maximum_retry {
 					return Err(Error::ServerError(format!("Status was {}, Body was {:?}", status_code, String::from_utf8(body))));
 				}
 				println!("INFO: Server Error, will retry: Status Code: {:?}", status_code);
@@ -760,7 +761,7 @@ mod test {
 		let security_profile: SecurityProfile = read_json_file("test.security_profile.json").unwrap();
 		let temp_config_dir = TempDir::new("rust-acd-test").unwrap();
 		let temp_upload_dir = temp_config_dir.path().file_name().unwrap();
-		let mut client = Client::new(&security_profile.client_id, &security_profile.client_secret, temp_config_dir.path()).unwrap();
+		let mut client = Client::new(&security_profile.client_id, &security_profile.client_secret, temp_config_dir.path(), 8).unwrap();
 		println!("temp_upload_dir: {:?}", temp_upload_dir);
 
 		// Test mkdir_all
